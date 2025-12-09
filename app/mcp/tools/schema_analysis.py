@@ -441,7 +441,7 @@ def analyze_field_usage(
     Args:
         object_name: Object API name (e.g., "Case", "Account", "CustomObject__c")
         field_name: Specific field to analyze (e.g., "Status", "Custom_Field__c").
-                   If None, analyzes ALL fields on the object.
+                   If None, analyzes ALL CUSTOM fields on the object (standard fields excluded).
         export_to_csv: Whether to export results to CSV file (default: True)
         output_file: Custom CSV filename. If None, auto-generates:
                     "{object_name}_field_usage_{timestamp}.csv"
@@ -459,10 +459,10 @@ def analyze_field_usage(
         # Analyze with reports
         analyze_field_usage("Case", "Status", include_reports=True)
 
-        # Analyze ALL fields on Case object (handles 500+ fields)
+        # Analyze ALL CUSTOM fields on Case object (standard fields excluded)
         analyze_field_usage("Case")
 
-        # Analyze with reports included
+        # Analyze all custom fields with reports included
         analyze_field_usage("Case", include_reports=True)
 
         # Custom CSV output
@@ -501,10 +501,10 @@ def analyze_field_usage(
                     "error": f"Field '{field_name}' not found on object '{object_name}'"
                 })
         else:
-            # All fields analysis
-            fields_to_analyze = describe["fields"]
+            # All fields analysis - only analyze custom fields (not standard fields)
+            fields_to_analyze = [f for f in describe["fields"] if f.get("custom", False)]
 
-        logger.info(f"Analyzing {len(fields_to_analyze)} fields...")
+        logger.info(f"Analyzing {len(fields_to_analyze)} fields (custom fields only)...")
         logger.info("PERFORMANCE MODE: Fetching all metadata in batches first (much faster!)...")
 
         # ===================================================================
@@ -550,28 +550,31 @@ def analyze_field_usage(
         try:
             logger.info("Fetching all active Flows via Tooling API...")
             # Query Flow objects to get latest active versions
-            flow_query = "SELECT Id, ApiName, Label, Status FROM Flow WHERE Status = 'Active'"
-            flow_result = sf.toolingexecute(f"query/?q={flow_query}")
+            flow_query = "SELECT Id, Definition.DeveloperName, Status FROM Flow WHERE Status = 'Active'"
+            flow_result = sf.restful("tooling/query", params={'q': flow_query})
 
             for flow in flow_result.get("records", []):
-                flow_label = flow.get("Label", "")
-                flow_api_name = flow.get("ApiName", "")
                 flow_id = flow.get("Id", "")
+                # Get DeveloperName from Definition object
+                definition = flow.get("Definition", {})
+                flow_api_name = definition.get("DeveloperName", "") if definition else ""
 
                 # Try to get flow metadata to check for field references
                 try:
                     # Fetch the flow's full definition which contains field references
-                    flow_metadata_query = f"SELECT Metadata FROM Flow WHERE Id = '{flow_id}'"
-                    flow_metadata = sf.toolingexecute(f"query/?q={flow_metadata_query}")
+                    flow_detail = sf.restful(f"tooling/sobjects/Flow/{flow_id}")
+                    metadata = flow_detail.get("Metadata", {})
+                    flow_label = metadata.get("label", flow_api_name)
 
                     # Combine all searchable content including metadata
-                    metadata_str = str(flow_metadata.get("records", [{}])[0].get("Metadata", {}))
+                    metadata_str = str(metadata)
                     flow_content = f"{flow_label} {flow_api_name} {metadata_str}"
 
-                except Exception as meta_err:
+                except Exception:
                     # If metadata fetch fails, use basic info
-                    logger.debug(f"Could not fetch full metadata for flow {flow_label}, using basic info")
-                    flow_content = f"{flow_label} {flow_api_name}"
+                    logger.debug(f"Could not fetch full metadata for flow {flow_api_name}, using basic info")
+                    flow_content = flow_api_name
+                    flow_label = flow_api_name
 
                 metadata_cache["flows"][flow_label or flow_api_name] = flow_content
                 logger.debug(f"Cached flow: {flow_label}")
@@ -583,19 +586,34 @@ def analyze_field_usage(
         # 4. Fetch ALL Validation Rules for this object (ONCE)
         try:
             logger.info("Fetching all Validation Rules...")
+            # First query: Get ValidationName and Id only (ErrorConditionFormula is not directly queryable)
             vr_query = f"""
-                SELECT Id, ValidationName, ErrorMessage, ErrorConditionFormula, Active
+                SELECT ValidationName, Id
                 FROM ValidationRule
                 WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND Active = true
             """
-            vr_result = sf.query_all(vr_query)
-            for vr in vr_result.get("records", []):
-                vr_name = vr["ValidationName"]
-                metadata_cache["validation_rules"][vr_name] = {
-                    "formula": vr.get("ErrorConditionFormula", ""),
-                    "error_msg": vr.get("ErrorMessage", ""),
-                    "name": vr_name
-                }
+            vr_result = sf.restful("tooling/query", params={'q': vr_query})
+
+            # Second step: Fetch full record with Metadata for each validation rule
+            for rec in vr_result.get("records", []):
+                vr_id = rec.get("Id")
+                vr_name = rec.get("ValidationName")
+
+                # Get full record with Metadata
+                try:
+                    detail = sf.restful(f"tooling/sobjects/ValidationRule/{vr_id}")
+                    metadata = detail.get("Metadata") or {}
+                    formula = metadata.get("errorConditionFormula", "")
+                    error_msg = metadata.get("errorMessage", "")
+
+                    metadata_cache["validation_rules"][vr_name] = {
+                        "formula": formula,
+                        "error_msg": error_msg,
+                        "name": vr_name
+                    }
+                except Exception as detail_error:
+                    logger.warning(f"Error fetching details for validation rule {vr_name}: {detail_error}")
+
             logger.info(f"  ✓ Cached {len(metadata_cache['validation_rules'])} validation rules")
         except Exception as e:
             logger.warning(f"Error fetching Validation Rules: {e}")
@@ -603,49 +621,77 @@ def analyze_field_usage(
         # 5. Fetch ALL Workflow Rules for this object (ONCE)
         try:
             logger.info("Fetching all Workflow Rules...")
+            # First query: Get Id and Name only (Formula is not directly queryable)
             wf_query = f"""
-                SELECT Id, Name, Formula
+                SELECT Id, Name
                 FROM WorkflowRule
                 WHERE TableEnumOrId = '{object_name}' AND IsActive = true
             """
-            wf_result = sf.query_all(wf_query)
-            for wf in wf_result.get("records", []):
-                metadata_cache["workflow_rules"][wf["Name"]] = wf.get("Formula", "")
+            wf_result = sf.restful("tooling/query", params={'q': wf_query})
+
+            # Second step: Fetch full record with Metadata for each workflow rule
+            for rec in wf_result.get("records", []):
+                wf_id = rec.get("Id")
+                wf_name = rec.get("Name")
+
+                # Get full record with Metadata
+                try:
+                    detail = sf.restful(f"tooling/sobjects/WorkflowRule/{wf_id}")
+                    metadata = detail.get("Metadata") or {}
+                    formula = metadata.get("formula", "")
+
+                    metadata_cache["workflow_rules"][wf_name] = formula
+                except Exception as detail_error:
+                    logger.warning(f"Error fetching details for workflow rule {wf_name}: {detail_error}")
+
             logger.info(f"  ✓ Cached {len(metadata_cache['workflow_rules'])} workflow rules")
         except Exception as e:
             logger.warning(f"Error fetching Workflow Rules: {e}")
 
         # 6. Fetch ALL Page Layouts for this object (ONCE)
         try:
-            logger.info("Fetching all Page Layouts...")
+            logger.info(f"Fetching all Page Layouts for {object_name}...")
+            # First query: Get Id, Name, and EntityDefinitionId
+            # Note: We'll filter by object after fetching to ensure we only get layouts for this object
             layout_query = f"""
-                SELECT Id, Name, TableEnumOrId
+                SELECT Id, Name, EntityDefinitionId, EntityDefinition.QualifiedApiName
                 FROM Layout
-                WHERE TableEnumOrId = '{object_name}'
+                WHERE EntityDefinition.QualifiedApiName = '{object_name}'
             """
-            layout_result = sf.query_all(layout_query)
+            layout_result = sf.restful("tooling/query", params={'q': layout_query})
 
-            # For each layout, get field items
-            for layout in layout_result.get("records", []):
-                layout_id = layout["Id"]
-                layout_name = layout["Name"]
+            layouts_for_object = layout_result.get("records", [])
+            logger.info(f"Found {len(layouts_for_object)} layouts for {object_name}")
+
+            # Second step: Fetch full record with Metadata for each layout
+            for layout in layouts_for_object:
+                layout_id = layout.get("Id")
+                layout_name = layout.get("Name")
 
                 try:
-                    field_items_query = f"""
-                        SELECT FieldName
-                        FROM FieldLayoutItem
-                        WHERE LayoutId = '{layout_id}'
-                    """
-                    field_items = sf.query_all(field_items_query)
-                    # Store field names (normalize to handle case variations)
-                    field_names = [item.get("FieldName", "").strip() for item in field_items.get("records", []) if item.get("FieldName")]
+                    # Get full record with Metadata
+                    layout_detail = sf.restful(f"tooling/sobjects/Layout/{layout_id}")
+                    metadata = layout_detail.get("Metadata", {})
+
+                    # Extract field names from layout sections
+                    field_names = []
+                    layout_sections = metadata.get("layoutSections", [])
+                    for section in layout_sections:
+                        layout_columns = section.get("layoutColumns", [])
+                        for column in layout_columns:
+                            layout_items = column.get("layoutItems", [])
+                            for item in layout_items:
+                                field_name = item.get("field")
+                                if field_name:
+                                    field_names.append(field_name.strip())
+
                     metadata_cache["layouts"][layout_name] = field_names
-                    logger.debug(f"Cached layout '{layout_name}' with {len(field_names)} fields (sample: {field_names[:3]})")
+                    logger.debug(f"Cached layout '{layout_name}' with {len(field_names)} fields")
                 except Exception as layout_err:
-                    logger.debug(f"Error fetching fields for layout {layout_name}: {layout_err}")
+                    logger.debug(f"Error fetching metadata for layout {layout_name}: {layout_err}")
                     metadata_cache["layouts"][layout_name] = []
 
-            logger.info(f"  ✓ Cached {len(metadata_cache['layouts'])} page layouts")
+            logger.info(f"  ✓ Cached {len(metadata_cache['layouts'])} page layouts for {object_name}")
         except Exception as e:
             logger.warning(f"Error fetching Page Layouts: {e}")
 
