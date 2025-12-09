@@ -397,6 +397,68 @@ def refresh_salesforce_token(user_id: str) -> bool:
         return False
 
 @register_tool
+def salesforce_get_domain_from_url(org_url: str) -> str:
+    """
+    Extract the domain parameter from a Salesforce org URL for use with login.
+
+    This helper tool makes it easy to get the correct domain parameter for authentication.
+
+    Args:
+        org_url: Full Salesforce org URL (e.g., https://curious-narwhal-rzlj6k-dev-ed.trailblaze.my.salesforce.com)
+
+    Returns:
+        JSON with extracted domain value
+
+    Example:
+        salesforce_get_domain_from_url("https://curious-narwhal-rzlj6k-dev-ed.trailblaze.my.salesforce.com")
+        Returns: "curious-narwhal-rzlj6k-dev-ed.trailblaze.my"
+    """
+    try:
+        import re
+        from urllib.parse import urlparse
+
+        # Parse URL
+        parsed = urlparse(org_url)
+        hostname = parsed.hostname or parsed.path
+
+        # Remove .salesforce.com
+        if hostname.endswith('.salesforce.com'):
+            domain = hostname.replace('.salesforce.com', '')
+        else:
+            domain = hostname
+
+        # Determine org type
+        if domain == 'login':
+            org_type = 'production'
+            login_url = 'https://login.salesforce.com'
+        elif domain == 'test':
+            org_type = 'sandbox'
+            login_url = 'https://test.salesforce.com'
+        elif 'sandbox' in domain.lower():
+            org_type = 'sandbox'
+            login_url = f'https://{domain}.salesforce.com'
+        else:
+            org_type = 'custom/developer'
+            login_url = f'https://{domain}.salesforce.com'
+
+        return _create_json_response(
+            True,
+            domain=domain,
+            org_type=org_type,
+            login_url=login_url,
+            original_url=org_url,
+            next_step=f"Use salesforce_login_username_password with domain: '{domain}'"
+        )
+
+    except Exception as e:
+        return _create_json_response(
+            False,
+            error=f"Failed to extract domain: {str(e)}",
+            original_url=org_url
+        )
+
+
+@register_tool
 def salesforce_login_username_password(username: str, password: str, security_token: str = "", domain: str = "login") -> str:
     """
     Login to Salesforce using username and password.

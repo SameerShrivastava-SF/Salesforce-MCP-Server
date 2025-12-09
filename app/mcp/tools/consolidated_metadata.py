@@ -171,27 +171,45 @@ def deploy_metadata(
                 )
 
         elif normalized_type in ["ValidationRule", "validation"]:
+            # ⚠️ CANNOT DEPLOY VALIDATION RULES VIA API
             object_name, rule_name = name.split(".", 1) if "." in name else (content_dict.get("objectName"), name)
-            if operation == "create":
-                return dynamic_tools.create_validation_rule(
-                    object_name=object_name,
-                    rule_name=rule_name,
-                    error_condition_formula=content_dict.get("formula", content_dict.get("errorConditionFormula", "")),
-                    error_message=content_dict.get("errorMessage", ""),
-                    error_display_field=content_dict.get("errorDisplayField", ""),
-                    description=content_dict.get("description", ""),
-                    active=content_dict.get("active", True)
-                )
-            else:
-                return dynamic_tools.upsert_validation_rule(
-                    object_name=object_name,
-                    rule_name=rule_name,
-                    error_condition_formula=content_dict.get("formula", content_dict.get("errorConditionFormula", "")),
-                    error_message=content_dict.get("errorMessage", ""),
-                    error_display_field=content_dict.get("errorDisplayField", ""),
-                    description=content_dict.get("description", ""),
-                    active=content_dict.get("active", True)
-                )
+
+            return json.dumps({
+                "success": False,
+                "error": "⚠️ MCP CANNOT deploy ValidationRules due to Salesforce API limitations",
+                "validation_rule_definition": {
+                    "Rule Name": rule_name,
+                    "Object": object_name,
+                    "Active": content_dict.get("active", True),
+                    "Description": content_dict.get("description", ""),
+                    "Error Condition Formula": content_dict.get("formula", content_dict.get("errorConditionFormula", "")),
+                    "Error Message": content_dict.get("errorMessage", ""),
+                    "Error Location": content_dict.get("errorDisplayField", "Top of Page")
+                },
+                "copy_paste_formula": {
+                    "title": "📝 COPY THIS FORMULA",
+                    "formula": content_dict.get("formula", content_dict.get("errorConditionFormula", ""))
+                },
+                "manual_deployment_required": {
+                    "title": "📋 MANUAL DEPLOYMENT REQUIRED",
+                    "warning": "This MCP server CANNOT deploy validation rules via API",
+                    "steps": [
+                        f"1. Open Salesforce Setup",
+                        f"2. Navigate to: Object Manager → {object_name} → Validation Rules",
+                        f"3. Click 'Edit' on: {rule_name}" if operation == "update" else f"3. Click 'New' button",
+                        f"4. Copy the values from 'validation_rule_definition' above",
+                        f"5. Paste into Salesforce UI fields",
+                        f"6. Click 'Save'",
+                        f"7. Test the validation rule"
+                    ]
+                },
+                "why_this_fails": "ValidationRules cannot be modified via REST/Tooling API. Only Metadata API (ZIP file), SFDX CLI, or manual UI update work.",
+                "alternatives": [
+                    "Manual UI update (2 minutes, 100% reliable)",
+                    "SFDX CLI: sf project deploy start -m 'ValidationRule:Object.RuleName'",
+                    "Metadata API ZIP deployment"
+                ]
+            }, indent=2)
 
         elif normalized_type in ["LightningComponentBundle", "LWC", "lwc"]:
             if operation == "create":

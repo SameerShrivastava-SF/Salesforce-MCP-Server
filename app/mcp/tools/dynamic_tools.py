@@ -1227,29 +1227,31 @@ Examples:
     try:
         sf = get_salesforce_connection()
 
+        # Use Metadata field to get formula - ErrorConditionFormula not directly queryable
         tooling_q = (
-            "SELECT Id, Name, Active, ErrorConditionFormula, ErrorDisplayField, ErrorMessage, "
-            "Description, CreatedDate, CreatedById, LastModifiedDate, LastModifiedById "
-            f"FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND Name = '{rule_name}'"
+            "SELECT Id, ValidationName, Active, Metadata "
+            f"FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND ValidationName = '{rule_name}'"
         )
         tooling_res = sf.toolingexecute(f"query/?q={tooling_q}")
         if tooling_res.get("size") == 0:
             return json.dumps({"success": False, "error": f"ValidationRule '{rule_name}' not found on object '{object_name}'"}, indent=2)
-        rule = tooling_res["records"][0]
 
-        # add CreatedBy / LastModifiedBy names
-        core_q = (
-            "SELECT Id, NamespacePrefix, CreatedBy.Name, LastModifiedBy.Name "
-            f"FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND Name = '{rule_name}'"
-        )
-        core_res = sf.query(core_q)
-        if core_res.get("records"):
-            extra = core_res["records"][0]
-            rule["CreatedByName"] = extra["CreatedBy"]["Name"]
-            rule["LastModifiedByName"] = extra["LastModifiedBy"]["Name"]
-            rule["NamespacePrefix"] = extra["NamespacePrefix"]
+        rule_record = tooling_res["records"][0]
+        metadata = rule_record.get("Metadata", {})
 
-        rule.pop("attributes", None)
+        # Build the response from metadata
+        rule = {
+            "Id": rule_record.get("Id"),
+            "Name": rule_record.get("ValidationName"),
+            "Active": metadata.get("active", rule_record.get("Active")),
+            "ErrorConditionFormula": metadata.get("errorConditionFormula", ""),
+            "ErrorDisplayField": metadata.get("errorDisplayField", ""),
+            "ErrorMessage": metadata.get("errorMessage", ""),
+            "Description": metadata.get("description", "")
+        }
+
+        # Note: CreatedBy/LastModifiedBy names not easily accessible for ValidationRule via API
+        # Would require additional queries with correct field names if needed
 
         return json.dumps({"success": True, "data": rule}, indent=2)
 
@@ -1269,12 +1271,10 @@ def create_validation_rule(
     description: str = "",
     active: bool = True
 ) -> str:
-    """Create a **new ValidationRule** with strict preflight checks and name-uniqueness
-enforcement.
+    """⚠️ CANNOT CREATE VALIDATION RULES VIA API
 
-This tool **only creates** a validation rule. It fails fast if any rule with the same
-`Name` already exists on the target object. To avoid broken deployments, follow the
-preflight checklist below.
+This function returns a complete validation rule definition for manual creation in Salesforce UI.
+ValidationRules cannot be deployed via REST/Tooling API due to Salesforce limitations.
 
 Built-in safeguards:
 - **Uniqueness check**: Queries `ValidationRule` by `Name` and `EntityDefinition`; if found, returns an error.
@@ -1371,71 +1371,52 @@ res = json.loads(create_validation_rule(
 assert res["success"], res
 """
 
-    try:
-        sf = get_salesforce_connection()
+    # ⚠️ CANNOT DEPLOY VALIDATION RULES VIA API
+    # Return complete definition for manual creation instead
+    return json.dumps({
+        "success": False,
+        "error": "⚠️ MCP CANNOT create ValidationRules due to Salesforce API limitations",
+        "operation": "create_validation_rule",
+        "validation_rule_definition": {
+            "Rule Name": rule_name,
+            "Object": object_name,
+            "Active": active,
+            "Description": description,
+            "Error Condition Formula": error_condition_formula,
+            "Error Message": error_message,
+            "Error Location": error_display_field or "Top of Page"
+        },
+        "copy_paste_formula": {
+            "title": "📝 COPY THIS FORMULA",
+            "formula": error_condition_formula
+        },
+        "manual_deployment_required": {
+            "title": "📋 MANUAL CREATION REQUIRED",
+            "warning": "This MCP server CANNOT create validation rules via API",
+            "steps": [
+                f"1. Open Salesforce Setup",
+                f"2. Navigate to: Object Manager → {object_name} → Validation Rules",
+                f"3. Click 'New' button",
+                f"4. Copy each field from 'validation_rule_definition' above:",
+                f"   - Rule Name: {rule_name}",
+                f"   - Active: {'Yes' if active else 'No'}",
+                f"   - Description: {description or '(leave empty)'}",
+                f"   - Error Condition Formula: (see copy_paste_formula above)",
+                f"   - Error Message: {error_message}",
+                f"   - Error Location: {error_display_field or 'Top of Page'}",
+                f"5. Click 'Save'",
+                f"6. Test the validation rule"
+            ]
+        },
+        "why_this_fails": "ValidationRules cannot be created via REST/Tooling API. Only Metadata API (ZIP file), SFDX CLI, or manual UI creation work.",
+        "alternatives": [
+            "Manual UI creation (2 minutes, 100% reliable)",
+            "SFDX CLI: sf project deploy start -m 'ValidationRule:Object.RuleName'",
+            "Metadata API ZIP deployment"
+        ]
+    }, indent=2)
 
-        # Check if validation rule already exists (must use Tooling API)
-        check_query = f"SELECT Id FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND Name = '{rule_name}'"
-        check = sf.toolingexecute(f"query/?q={check_query}")
-        if check.get("size", 0) > 0:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"ValidationRule '{rule_name}' already exists on object '{object_name}'. Use upsert_validation_rule to update it.",
-                },
-                indent=2,
-            )
-
-        # Validate rule name
-        if not rule_name.replace("_", "").isalnum():
-            return json.dumps(
-                {"success": False, "error": "Invalid rule name. Use only alphanumeric characters and underscores."},
-                indent=2,
-            )
-
-        # Validate object exists
-        try:
-            getattr(sf, object_name).describe()
-        except Exception:
-            return json.dumps(
-                {"success": False, "error": f"Target object '{object_name}' not found"},
-                indent=2,
-            )
-
-        # Validate error display field if provided
-        if error_display_field:
-            try:
-                desc = getattr(sf, object_name).describe()
-                field_exists = any(f["name"] == error_display_field for f in desc["fields"])
-                if not field_exists:
-                    return json.dumps(
-                        {"success": False, "error": f"Error display field '{error_display_field}' not found on object '{object_name}'"},
-                        indent=2,
-                    )
-            except Exception:
-                return json.dumps(
-                    {"success": False, "error": f"Could not validate error display field '{error_display_field}' on object '{object_name}'"},
-                    indent=2,
-                )
-
-        res = deploy_validation_rule_internal(
-            sf, object_name, rule_name, error_condition_formula, 
-            error_message, error_display_field, description, active
-        )
-        
-        return json.dumps({
-            "success": res.get("success", False),
-            "operation": "create_validation_rule",
-            "object_name": object_name,
-            "rule_name": rule_name,
-            "message": f"Successfully created ValidationRule '{rule_name}' on {object_name}" if res.get("success") else f"Failed to create ValidationRule '{rule_name}' on {object_name}",
-            "job_id": res.get("job_id"),
-            "errors": res.get("details") if not res.get("success") else None
-        }, indent=2)
-
-    except Exception as e:
-        logger.error("create_validation_rule: %s", e, exc_info=True)
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+    # OLD CODE REMOVED - Would attempt deployment which always fails
 
 
 # DEPRECATED: Use deploy_metadata or fetch_metadata instead
@@ -1449,12 +1430,10 @@ def upsert_validation_rule(
     description: str = "",
     active: bool = True
 ) -> str:
-    """Update an existing **ValidationRule** with a context-first, schema-safe workflow.
+    """⚠️ CANNOT UPDATE VALIDATION RULES VIA API
 
-This tool **only updates** an existing validation rule. It preserves the current
-settings unless you pass new values. To prevent breaking changes, follow the
-preflight checklist below so you don't push formulas that reference *nonexistent*
-fields or objects.
+This function returns a complete validation rule definition for manual update in Salesforce UI.
+ValidationRules cannot be deployed via REST/Tooling API due to Salesforce limitations.
 
 Preflight checklist (caller responsibility):
 1) **Fetch current rule first (know the context)**
@@ -1550,54 +1529,51 @@ Implementation notes:
   - regex-scans formula strings for field tokens, and
   - calls `fetch_custom_field` for each token.
 """
-    try:
-        sf = get_salesforce_connection()
-        # Must use Tooling API for ValidationRule
-        check_query = f"SELECT Id FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = '{object_name}' AND Name = '{rule_name}'"
-        check = sf.toolingexecute(f"query/?q={check_query}")
-        if check.get("size", 0) == 0:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"ValidationRule '{rule_name}' not found on object '{object_name}' (use create_validation_rule to create new rules)",
-                },
-                indent=2,
-            )
+    # ⚠️ CANNOT DEPLOY VALIDATION RULES VIA API
+    # Return complete definition for manual update instead
+    return json.dumps({
+        "success": False,
+        "error": "⚠️ MCP CANNOT update ValidationRules due to Salesforce API limitations",
+        "operation": "upsert_validation_rule",
+        "validation_rule_definition": {
+            "Rule Name": rule_name,
+            "Object": object_name,
+            "Active": active,
+            "Description": description,
+            "Error Condition Formula": error_condition_formula,
+            "Error Message": error_message,
+            "Error Location": error_display_field or "Top of Page"
+        },
+        "copy_paste_formula": {
+            "title": "📝 COPY THIS FORMULA",
+            "formula": error_condition_formula
+        },
+        "manual_deployment_required": {
+            "title": "📋 MANUAL UPDATE REQUIRED",
+            "warning": "This MCP server CANNOT update validation rules via API",
+            "steps": [
+                f"1. Open Salesforce Setup",
+                f"2. Navigate to: Object Manager → {object_name} → Validation Rules",
+                f"3. Click 'Edit' on: {rule_name}",
+                f"4. Copy each field from 'validation_rule_definition' above:",
+                f"   - Active: {'Yes' if active else 'No'}",
+                f"   - Description: {description or '(leave empty)'}",
+                f"   - Error Condition Formula: (see copy_paste_formula above)",
+                f"   - Error Message: {error_message}",
+                f"   - Error Location: {error_display_field or 'Top of Page'}",
+                f"5. Click 'Save'",
+                f"6. Test the validation rule"
+            ]
+        },
+        "why_this_fails": "ValidationRules cannot be updated via REST/Tooling API. Only Metadata API (ZIP file), SFDX CLI, or manual UI update work.",
+        "alternatives": [
+            "Manual UI update (2 minutes, 100% reliable)",
+            "SFDX CLI: sf project deploy start -m 'ValidationRule:Object.RuleName'",
+            "Metadata API ZIP deployment"
+        ]
+    }, indent=2)
 
-        # Validate error display field if provided
-        if error_display_field:
-            try:
-                desc = getattr(sf, object_name).describe()
-                field_exists = any(f["name"] == error_display_field for f in desc["fields"])
-                if not field_exists:
-                    return json.dumps(
-                        {"success": False, "error": f"Error display field '{error_display_field}' not found on object '{object_name}'"},
-                        indent=2,
-                    )
-            except Exception:
-                return json.dumps(
-                    {"success": False, "error": f"Could not validate error display field '{error_display_field}' on object '{object_name}'"},
-                    indent=2,
-                )
-
-        res = deploy_validation_rule_internal(
-            sf, object_name, rule_name, error_condition_formula, 
-            error_message, error_display_field, description, active
-        )
-        
-        return json.dumps({
-            "success": res.get("success", False),
-            "operation": "update_validation_rule",
-            "object_name": object_name,
-            "rule_name": rule_name,
-            "message": f"Successfully updated ValidationRule '{rule_name}' on {object_name}" if res.get("success") else f"Failed to update ValidationRule '{rule_name}' on {object_name}",
-            "job_id": res.get("job_id"),
-            "errors": res.get("details") if not res.get("success") else None
-        }, indent=2)
-
-    except Exception as e:
-        logger.error("upsert_validation_rule: %s", e, exc_info=True)
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+    # OLD CODE REMOVED - Would attempt deployment which always fails
 
 
 # =============================================================================
