@@ -1,9 +1,14 @@
 """Input validation utilities for Salesforce metadata and data operations
 
 Created by Sameer
+
+Enhanced with:
+- SOQL injection protection
+- Safe string escaping functions
+- Query builder helpers
 """
 import re
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 
 class ValidationError(Exception):
@@ -12,6 +17,247 @@ class ValidationError(Exception):
     Added by Sameer
     """
     pass
+
+
+# =============================================================================
+# SOQL INJECTION PROTECTION
+# =============================================================================
+
+def escape_soql_string(value: str) -> str:
+    """
+    Escape a string value for safe use in SOQL queries.
+    Prevents SOQL injection attacks.
+
+    Args:
+        value: The string value to escape
+
+    Returns:
+        Escaped string safe for SOQL
+
+    Example:
+        name = escape_soql_string("O'Reilly")  # Returns: O\'Reilly
+        query = f"SELECT Id FROM Account WHERE Name = '{name}'"
+    """
+    if value is None:
+        return ""
+
+    # Convert to string if not already
+    value = str(value)
+
+    # Escape single quotes by doubling them (SOQL standard)
+    value = value.replace("'", "\\'")
+
+    # Escape backslashes
+    value = value.replace("\\", "\\\\")
+
+    # Remove null bytes
+    value = value.replace("\x00", "")
+
+    # Remove other potentially dangerous characters
+    value = value.replace("\n", " ").replace("\r", " ")
+
+    return value
+
+
+def escape_soql_like(value: str) -> str:
+    """
+    Escape a string for use in SOQL LIKE clauses.
+    Escapes wildcard characters in addition to standard escaping.
+
+    Args:
+        value: The string value to escape for LIKE
+
+    Returns:
+        Escaped string safe for SOQL LIKE clause
+
+    Example:
+        pattern = escape_soql_like("50%")  # Returns: 50\%
+        query = f"SELECT Id FROM Account WHERE Name LIKE '%{pattern}%'"
+    """
+    if value is None:
+        return ""
+
+    # First apply standard escaping
+    value = escape_soql_string(value)
+
+    # Escape LIKE wildcards
+    value = value.replace("%", "\\%")
+    value = value.replace("_", "\\_")
+
+    return value
+
+
+def build_safe_soql_in_clause(values: List[str]) -> str:
+    """
+    Build a safe IN clause for SOQL queries.
+
+    Args:
+        values: List of string values for IN clause
+
+    Returns:
+        Safe IN clause string like ('val1','val2','val3')
+
+    Example:
+        ids = ["001xx", "001yy"]
+        in_clause = build_safe_soql_in_clause(ids)
+        query = f"SELECT Id FROM Account WHERE Id IN {in_clause}"
+    """
+    if not values:
+        return "()"
+
+    escaped_values = [f"'{escape_soql_string(v)}'" for v in values]
+    return f"({','.join(escaped_values)})"
+
+
+def build_safe_where_clause(field: str, operator: str, value: Any) -> str:
+    """
+    Build a safe WHERE clause condition.
+
+    Args:
+        field: Field API name
+        operator: SOQL operator (=, !=, LIKE, IN, >, <, >=, <=)
+        value: Value to compare (string, number, list, or boolean)
+
+    Returns:
+        Safe WHERE clause condition
+
+    Example:
+        condition = build_safe_where_clause("Name", "LIKE", "Acme%")
+        query = f"SELECT Id FROM Account WHERE {condition}"
+    """
+    # Validate field name to prevent injection
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9_\.]*$', field):
+        raise ValidationError(f"Invalid field name: {field}")
+
+    # Validate operator
+    valid_operators = ['=', '!=', '<>', 'LIKE', 'IN', 'NOT IN', '>', '<', '>=', '<=', 'INCLUDES', 'EXCLUDES']
+    if operator.upper() not in valid_operators:
+        raise ValidationError(f"Invalid operator: {operator}")
+
+    operator = operator.upper()
+
+    # Handle different value types
+    if value is None:
+        return f"{field} = null"
+
+    elif isinstance(value, bool):
+        return f"{field} {operator} {str(value).lower()}"
+
+    elif isinstance(value, (int, float)):
+        return f"{field} {operator} {value}"
+
+    elif isinstance(value, list):
+        if operator in ['IN', 'NOT IN']:
+            in_clause = build_safe_soql_in_clause(value)
+            return f"{field} {operator} {in_clause}"
+        else:
+            raise ValidationError(f"List values only supported with IN/NOT IN operators")
+
+    else:
+        # String value
+        if operator == 'LIKE':
+            escaped = escape_soql_string(str(value))  # Don't escape wildcards for LIKE
+        else:
+            escaped = escape_soql_string(str(value))
+        return f"{field} {operator} '{escaped}'"
+
+
+class SafeSOQLBuilder:
+    """
+    Builder class for constructing safe SOQL queries.
+
+    Example:
+        query = (SafeSOQLBuilder()
+            .select(['Id', 'Name', 'Industry'])
+            .from_object('Account')
+            .where('Name', 'LIKE', 'Acme%')
+            .where('Industry', '=', 'Technology')
+            .order_by('Name')
+            .limit(100)
+            .build())
+    """
+
+    def __init__(self):
+        self._select_fields: List[str] = []
+        self._from_object: str = ""
+        self._where_conditions: List[str] = []
+        self._order_by: Optional[str] = None
+        self._limit: Optional[int] = None
+        self._offset: Optional[int] = None
+
+    def select(self, fields: List[str]) -> 'SafeSOQLBuilder':
+        """Add SELECT fields"""
+        for field in fields:
+            # Validate field name
+            if not re.match(r'^[a-zA-Z][a-zA-Z0-9_\.]*$', field):
+                raise ValidationError(f"Invalid field name: {field}")
+            self._select_fields.append(field)
+        return self
+
+    def from_object(self, obj: str) -> 'SafeSOQLBuilder':
+        """Set FROM object"""
+        # Validate object name
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]*(__c|__mdt|__e|__b|__x|__r)?$', obj):
+            raise ValidationError(f"Invalid object name: {obj}")
+        self._from_object = obj
+        return self
+
+    def where(self, field: str, operator: str, value: Any) -> 'SafeSOQLBuilder':
+        """Add WHERE condition"""
+        condition = build_safe_where_clause(field, operator, value)
+        self._where_conditions.append(condition)
+        return self
+
+    def where_raw(self, condition: str) -> 'SafeSOQLBuilder':
+        """Add raw WHERE condition (use with caution - must be pre-escaped)"""
+        self._where_conditions.append(condition)
+        return self
+
+    def order_by(self, field: str, direction: str = 'ASC') -> 'SafeSOQLBuilder':
+        """Set ORDER BY"""
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9_\.]*$', field):
+            raise ValidationError(f"Invalid field name for ORDER BY: {field}")
+        if direction.upper() not in ['ASC', 'DESC']:
+            raise ValidationError(f"Invalid ORDER BY direction: {direction}")
+        self._order_by = f"{field} {direction.upper()}"
+        return self
+
+    def limit(self, limit: int) -> 'SafeSOQLBuilder':
+        """Set LIMIT"""
+        if not isinstance(limit, int) or limit < 0:
+            raise ValidationError(f"Invalid LIMIT value: {limit}")
+        self._limit = limit
+        return self
+
+    def offset(self, offset: int) -> 'SafeSOQLBuilder':
+        """Set OFFSET"""
+        if not isinstance(offset, int) or offset < 0:
+            raise ValidationError(f"Invalid OFFSET value: {offset}")
+        self._offset = offset
+        return self
+
+    def build(self) -> str:
+        """Build the final SOQL query"""
+        if not self._select_fields:
+            raise ValidationError("No fields specified in SELECT")
+        if not self._from_object:
+            raise ValidationError("No object specified in FROM")
+
+        query = f"SELECT {', '.join(self._select_fields)} FROM {self._from_object}"
+
+        if self._where_conditions:
+            query += f" WHERE {' AND '.join(self._where_conditions)}"
+
+        if self._order_by:
+            query += f" ORDER BY {self._order_by}"
+
+        if self._limit is not None:
+            query += f" LIMIT {self._limit}"
+
+        if self._offset is not None:
+            query += f" OFFSET {self._offset}"
+
+        return query
 
 
 def validate_api_name(name: str, metadata_type: str = "API") -> bool:
