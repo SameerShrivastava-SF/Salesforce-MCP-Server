@@ -4,7 +4,6 @@ Supports environment variables and .env files
 
 Created by Sameer
 """
-import os
 from typing import Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings
@@ -25,7 +24,7 @@ class SalesforceConfig(BaseSettings):
     oauth_timeout_seconds: int = Field(default=300, description="OAuth login timeout in seconds")
 
     # API Configuration
-    salesforce_api_version: str = Field(default="59.0", description="Salesforce API version")
+    salesforce_api_version: str = Field(default="62.0", description="Salesforce API version")
     max_retries: int = Field(default=3, description="Maximum retry attempts for API calls")
     retry_backoff_seconds: float = Field(default=2.0, description="Retry backoff multiplier")
     request_timeout_seconds: int = Field(default=120, description="Default request timeout")

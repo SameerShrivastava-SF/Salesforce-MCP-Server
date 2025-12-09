@@ -17,6 +17,12 @@ from app.mcp.tools import dynamic_tools as _dynamic_tools  # noqa: F401
 from app.mcp.tools import user_management as _user_management  # noqa: F401
 from app.mcp.tools import advanced_comparison as _advanced_comparison  # noqa: F401
 
+# Debugging and defect-solving tools (NEW - comprehensive debugging capabilities)
+from app.mcp.tools import debugging as _debugging  # noqa: F401
+
+# Schema analysis tools (field usage analysis)
+from app.mcp.tools import schema_analysis as _schema_analysis  # noqa: F401
+
 if __name__ == "__main__":
     config = get_config()
     logging.basicConfig(stream=sys.stderr, level=getattr(logging, config.log_level.upper()))
